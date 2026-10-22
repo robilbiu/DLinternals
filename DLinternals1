@@ -1,0 +1,1758 @@
+#!/usr/bin/env python3
+"""
+Unified experiment and analysis pipeline for the manuscript:
+
+    Reliable Internal Training Diagnostics for Deep Neural Networks:
+    A Multi-Seed Study of Layer-Wise Weight-Update Dynamics
+
+The script keeps the official test sets untouched, creates a stratified
+validation split only from the official training set, runs a reproducible
+multi-seed experiment matrix, records external and internal training metrics,
+and produces publication-ready CSV tables and figures.
+
+Install
+-------
+python -m pip install torch torchvision numpy pandas scipy scikit-learn \
+    matplotlib seaborn tqdm statsmodels
+
+Paper run (120 runs)
+--------------------
+python internal_dynamics_study.py all --output results_paper --preset paper \
+    --seeds 0 1 2 3 4 --epochs 30 --device auto
+
+Small end-to-end check
+----------------------
+python internal_dynamics_study.py all --output results_smoke --preset smoke \
+    --seeds 0 --epochs 2 --device auto
+
+Resume an interrupted run
+-------------------------
+Run the same command again. Completed run JSON files are detected and skipped.
+
+Analyze existing completed runs only
+------------------------------------
+python internal_dynamics_study.py analyze --output results_paper
+
+Important output files
+----------------------
+results_paper/tables/run_metrics.csv
+results_paper/tables/epoch_metrics.csv
+results_paper/tables/layer_epoch_metrics.csv
+results_paper/tables/config_summary.csv
+results_paper/tables/early_diagnostics.csv
+results_paper/tables/early_predictor_comparison.csv
+results_paper/tables/spearman_correlations.csv
+results_paper/tables/fixed_effects_models.csv
+results_paper/figures/*.png and *.pdf
+
+The code intentionally uses balanced binary tasks so that failure definitions
+and cross-dataset comparisons are interpretable:
+  * MNIST: digits 4 versus 9
+  * Fashion-MNIST: Pullover (2) versus Shirt (6)
+  * CIFAR-10: Cat (3) versus Dog (5)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import platform
+import random
+import sys
+import time
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from scipy import stats
+from sklearn.base import clone
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, transforms
+
+
+EPS = 1e-12
+SCHEMA_VERSION = "1.0"
+EARLY_EPOCHS = 3
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    name: str
+    negative_class: int
+    positive_class: int
+    channels: int
+    image_size: int
+    mean: Tuple[float, ...]
+    std: Tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    dataset: str
+    architecture: str
+    scenario: str
+    seed: int
+    depth: int
+    width: int
+    activation: str
+    residual: bool
+    optimizer: str
+    learning_rate: float
+    batch_size: int
+    weight_decay: float = 0.0
+
+    @property
+    def config_id(self) -> str:
+        return (
+            f"{self.dataset}__{self.architecture}__{self.scenario}"
+            f"__d{self.depth}__w{self.width}__{self.activation}"
+            f"__res{int(self.residual)}__{self.optimizer}"
+            f"__lr{self.learning_rate:g}__b{self.batch_size}"
+        )
+
+    @property
+    def run_id(self) -> str:
+        return f"{self.config_id}__seed{self.seed}"
+
+
+DATASETS: Dict[str, DatasetSpec] = {
+    "mnist": DatasetSpec("mnist", 4, 9, 1, 28, (0.1307,), (0.3081,)),
+    "fashion": DatasetSpec("fashion", 2, 6, 1, 28, (0.2860,), (0.3530,)),
+    "cifar": DatasetSpec(
+        "cifar", 3, 5, 3, 32,
+        (0.4914, 0.4822, 0.4465),
+        (0.2470, 0.2435, 0.2616),
+    ),
+}
+
+
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(requested)
+
+
+def atomic_json_dump(payload: Mapping[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
+    tmp.replace(path)
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    if isinstance(value, (bool, str, int)) or value is None:
+        return value
+    return str(value)
+
+
+class BinaryClassSubset(Dataset):
+    """Binary view of a torchvision dataset without touching its test split."""
+
+    def __init__(self, base: Dataset, indices: Sequence[int], negative: int, positive: int):
+        self.base = base
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.negative = int(negative)
+        self.positive = int(positive)
+
+    def __len__(self) -> int:
+        return int(self.indices.size)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
+        image, label = self.base[int(self.indices[index])]
+        binary_label = 1 if int(label) == self.positive else 0
+        return image, binary_label
+
+
+def dataset_targets(dataset: Dataset) -> np.ndarray:
+    targets = getattr(dataset, "targets", None)
+    if targets is None:
+        raise AttributeError("Dataset has no targets attribute")
+    if torch.is_tensor(targets):
+        targets = targets.cpu().numpy()
+    return np.asarray(targets, dtype=np.int64)
+
+
+def balanced_binary_indices(
+    targets: np.ndarray,
+    negative: int,
+    positive: int,
+    seed: int,
+    max_per_class: Optional[int] = None,
+) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    neg = np.flatnonzero(targets == negative)
+    pos = np.flatnonzero(targets == positive)
+    n = min(len(neg), len(pos))
+    if max_per_class is not None:
+        n = min(n, max_per_class)
+    neg = rng.choice(neg, size=n, replace=False)
+    pos = rng.choice(pos, size=n, replace=False)
+    combined = np.concatenate([neg, pos])
+    rng.shuffle(combined)
+    return combined
+
+
+def stratified_train_val_indices(
+    targets: np.ndarray,
+    selected_indices: np.ndarray,
+    negative: int,
+    positive: int,
+    val_fraction: float,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    selected_targets = targets[selected_indices]
+    train_parts: List[np.ndarray] = []
+    val_parts: List[np.ndarray] = []
+    for label in (negative, positive):
+        part = selected_indices[selected_targets == label].copy()
+        rng.shuffle(part)
+        n_val = max(1, int(round(len(part) * val_fraction)))
+        val_parts.append(part[:n_val])
+        train_parts.append(part[n_val:])
+    train_idx = np.concatenate(train_parts)
+    val_idx = np.concatenate(val_parts)
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    return train_idx, val_idx
+
+
+def load_base_datasets(spec: DatasetSpec, data_root: Path) -> Tuple[Dataset, Dataset]:
+    normalize = transforms.Normalize(spec.mean, spec.std)
+    transform = transforms.Compose([transforms.ToTensor(), normalize])
+    if spec.name == "mnist":
+        train = datasets.MNIST(data_root, train=True, download=True, transform=transform)
+        test = datasets.MNIST(data_root, train=False, download=True, transform=transform)
+    elif spec.name == "fashion":
+        train = datasets.FashionMNIST(data_root, train=True, download=True, transform=transform)
+        test = datasets.FashionMNIST(data_root, train=False, download=True, transform=transform)
+    elif spec.name == "cifar":
+        train = datasets.CIFAR10(data_root, train=True, download=True, transform=transform)
+        test = datasets.CIFAR10(data_root, train=False, download=True, transform=transform)
+    else:
+        raise ValueError(f"Unknown dataset: {spec.name}")
+    return train, test
+
+
+def make_loaders(
+    spec: DatasetSpec,
+    data_root: Path,
+    batch_size: int,
+    seed: int,
+    val_fraction: float,
+    workers: int,
+    max_train_per_class: Optional[int],
+    max_test_per_class: Optional[int],
+) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, int]]:
+    base_train, base_test = load_base_datasets(spec, data_root)
+    train_targets = dataset_targets(base_train)
+    test_targets = dataset_targets(base_test)
+
+    selected_train = balanced_binary_indices(
+        train_targets,
+        spec.negative_class,
+        spec.positive_class,
+        seed=12345,
+        max_per_class=max_train_per_class,
+    )
+    train_idx, val_idx = stratified_train_val_indices(
+        train_targets,
+        selected_train,
+        spec.negative_class,
+        spec.positive_class,
+        val_fraction,
+        seed=12345,
+    )
+    test_idx = balanced_binary_indices(
+        test_targets,
+        spec.negative_class,
+        spec.positive_class,
+        seed=54321,
+        max_per_class=max_test_per_class,
+    )
+
+    train_set = BinaryClassSubset(
+        base_train, train_idx, spec.negative_class, spec.positive_class
+    )
+    val_set = BinaryClassSubset(
+        base_train, val_idx, spec.negative_class, spec.positive_class
+    )
+    test_set = BinaryClassSubset(
+        base_test, test_idx, spec.negative_class, spec.positive_class
+    )
+
+    generator = torch.Generator().manual_seed(seed)
+    common = dict(
+        num_workers=workers,
+        pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker if workers else None,
+        persistent_workers=bool(workers),
+    )
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+        **common,
+    )
+    val_loader = DataLoader(val_set, batch_size=batch_size * 2, shuffle=False, **common)
+    test_loader = DataLoader(test_set, batch_size=batch_size * 2, shuffle=False, **common)
+    sizes = {"train": len(train_set), "val": len(val_set), "test": len(test_set)}
+    return train_loader, val_loader, test_loader, sizes
+
+
+def activation_module(name: str) -> nn.Module:
+    name = name.lower()
+    if name == "relu":
+        return nn.ReLU()
+    if name == "leaky_relu":
+        return nn.LeakyReLU(0.01)
+    if name == "sigmoid":
+        return nn.Sigmoid()
+    if name == "tanh":
+        return nn.Tanh()
+    raise ValueError(f"Unsupported activation: {name}")
+
+
+class PlainMLP(nn.Module):
+    def __init__(self, input_dim: int, depth: int, width: int, activation: str):
+        super().__init__()
+        layers: List[nn.Module] = [nn.Flatten(), nn.Linear(input_dim, width), activation_module(activation)]
+        for _ in range(depth - 1):
+            layers.extend([nn.Linear(width, width), activation_module(activation)])
+        self.features = nn.Sequential(*layers)
+        self.classifier = nn.Linear(width, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(x))
+
+
+class ResidualMLP(nn.Module):
+    def __init__(self, input_dim: int, depth: int, width: int, activation: str):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.input = nn.Linear(input_dim, width)
+        self.blocks = nn.ModuleList([nn.Linear(width, width) for _ in range(depth - 1)])
+        self.activation = activation_module(activation)
+        self.classifier = nn.Linear(width, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.activation(self.input(self.flatten(x)))
+        for layer in self.blocks:
+            x = self.activation(layer(x) + x)
+        return self.classifier(x)
+
+
+class PlainConvBlock(nn.Module):
+    def __init__(self, channels: int, activation: str):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+        self.activation = activation_module(activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.conv(x))
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int, activation: str):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+        self.activation = activation_module(activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.conv(x) + x)
+
+
+class DiagnosticCNN(nn.Module):
+    """CNN with matched plain/residual variants and no batch normalization."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        depth: int,
+        width: int,
+        activation: str,
+        residual: bool,
+    ):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, width, 3, padding=1), activation_module(activation)
+        )
+        block = ResidualConvBlock if residual else PlainConvBlock
+        self.blocks = nn.ModuleList([block(width, activation) for _ in range(depth - 1)])
+        self.pool_after = set(
+            np.linspace(1, max(1, depth - 2), num=min(3, max(1, depth // 4)), dtype=int).tolist()
+        )
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Linear(width, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        for index, layer in enumerate(self.blocks):
+            x = layer(x)
+            if index in self.pool_after and min(x.shape[-2:]) >= 4:
+                x = nn.functional.max_pool2d(x, 2)
+        x = self.global_pool(x).flatten(1)
+        return self.classifier(x)
+
+
+def build_model(config: RunConfig, spec: DatasetSpec) -> nn.Module:
+    if config.architecture == "mlp":
+        input_dim = spec.channels * spec.image_size * spec.image_size
+        cls = ResidualMLP if config.residual else PlainMLP
+        return cls(input_dim, config.depth, config.width, config.activation)
+    if config.architecture == "cnn":
+        return DiagnosticCNN(
+            spec.channels,
+            config.depth,
+            config.width,
+            config.activation,
+            config.residual,
+        )
+    raise ValueError(f"Unknown architecture: {config.architecture}")
+
+
+def make_optimizer(config: RunConfig, model: nn.Module) -> torch.optim.Optimizer:
+    parameters = model.parameters()
+    name = config.optimizer.lower()
+    if name == "adam":
+        return torch.optim.Adam(
+            parameters, lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+    if name == "rmsprop":
+        return torch.optim.RMSprop(
+            parameters, lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+    if name == "sgd":
+        return torch.optim.SGD(
+            parameters, lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+    if name == "momentum":
+        return torch.optim.SGD(
+            parameters,
+            lr=config.learning_rate,
+            momentum=0.9,
+            weight_decay=config.weight_decay,
+        )
+    raise ValueError(f"Unknown optimizer: {config.optimizer}")
+
+
+class LayerUpdateTracker:
+    """Online layer-level update diagnostics without storing full weight histories."""
+
+    METRICS = (
+        "weight_l2",
+        "gradient_l2",
+        "gradient_abs_mean",
+        "update_l2",
+        "update_abs_mean",
+        "update_rms",
+        "update_abs_median_sample",
+        "update_abs_max",
+        "update_to_weight_ratio",
+        "top3_update_share",
+        "normalized_update_entropy",
+        "top3_jaccard_previous_step",
+    )
+
+    def __init__(self, model: nn.Module, sample_size: int = 4096):
+        self.sample_size = sample_size
+        self.parameters = {
+            name: parameter
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.ndim >= 2
+        }
+        self.previous_top3: Dict[str, set[int]] = {}
+        self.top1_counts: Dict[str, Counter[int]] = defaultdict(Counter)
+        self.top3_counts: Dict[str, Counter[int]] = defaultdict(Counter)
+        self.reset_epoch()
+
+    def reset_epoch(self) -> None:
+        self.steps = 0
+        self.sums: Dict[str, Dict[str, float]] = {
+            name: defaultdict(float) for name in self.parameters
+        }
+        self.top1_counts = defaultdict(Counter)
+        self.top3_counts = defaultdict(Counter)
+
+    def snapshot(self) -> Dict[str, torch.Tensor]:
+        return {name: parameter.detach().clone() for name, parameter in self.parameters.items()}
+
+    @torch.no_grad()
+    def observe(self, before: Mapping[str, torch.Tensor]) -> None:
+        self.steps += 1
+        for name, parameter in self.parameters.items():
+            old = before[name]
+            delta = (parameter.detach() - old).reshape(-1)
+            abs_delta = delta.abs()
+            grad = parameter.grad.detach().reshape(-1) if parameter.grad is not None else None
+            weight_l2 = float(old.norm().item())
+            update_l2 = float(delta.norm().item())
+            update_abs_sum = float(abs_delta.sum().item())
+            k = min(3, abs_delta.numel())
+            top_values, top_indices = torch.topk(abs_delta, k=k)
+            indices = [int(item) for item in top_indices.cpu().tolist()]
+            current_top3 = set(indices)
+            previous = self.previous_top3.get(name)
+            jaccard = (
+                len(previous & current_top3) / max(1, len(previous | current_top3))
+                if previous is not None
+                else 0.0
+            )
+            self.previous_top3[name] = current_top3
+            self.top1_counts[name][indices[0]] += 1
+            self.top3_counts[name].update(indices)
+
+            if abs_delta.numel() > self.sample_size:
+                sample_idx = torch.linspace(
+                    0, abs_delta.numel() - 1, self.sample_size, device=abs_delta.device
+                ).long()
+                sampled = abs_delta[sample_idx]
+            else:
+                sampled = abs_delta
+            probability = sampled / (sampled.sum() + EPS)
+            entropy = float(-(probability * (probability + EPS).log()).sum().item())
+            normalized_entropy = entropy / max(EPS, math.log(max(2, sampled.numel())))
+
+            values = {
+                "weight_l2": weight_l2,
+                "gradient_l2": float(grad.norm().item()) if grad is not None else 0.0,
+                "gradient_abs_mean": float(grad.abs().mean().item()) if grad is not None else 0.0,
+                "update_l2": update_l2,
+                "update_abs_mean": float(abs_delta.mean().item()),
+                "update_rms": float(torch.sqrt(torch.mean(delta.square())).item()),
+                "update_abs_median_sample": float(sampled.median().item()),
+                "update_abs_max": float(abs_delta.max().item()),
+                "update_to_weight_ratio": update_l2 / (weight_l2 + EPS),
+                "top3_update_share": float(top_values.sum().item()) / (update_abs_sum + EPS),
+                "normalized_update_entropy": normalized_entropy,
+                "top3_jaccard_previous_step": jaccard,
+            }
+            for metric, value in values.items():
+                self.sums[name][metric] += float(value)
+
+    def epoch_rows(self, epoch: int) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        denominator = max(1, self.steps)
+        for name in self.parameters:
+            top1 = self.top1_counts[name]
+            top3 = self.top3_counts[name]
+            total_seen = sum(top3.values())
+            row: Dict[str, Any] = {
+                "epoch": epoch,
+                "layer": name,
+                "optimizer_steps": self.steps,
+                "parameter_count": int(self.parameters[name].numel()),
+                "top1_max_occupancy": max(top1.values(), default=0) / denominator,
+                "top3_max_occupancy": max(top3.values(), default=0) / denominator,
+                "top3_unique_parameters": len(top3),
+                "top3_total_observations": total_seen,
+            }
+            for metric in self.METRICS:
+                row[metric] = self.sums[name][metric] / denominator
+            rows.append(row)
+        return rows
+
+
+def classification_metrics(labels: np.ndarray, probabilities: np.ndarray) -> Dict[str, float]:
+    predictions = (probabilities >= 0.5).astype(np.int64)
+    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
+    specificity = tn / max(1, tn + fp)
+    result = {
+        "accuracy": accuracy_score(labels, predictions),
+        "balanced_accuracy": balanced_accuracy_score(labels, predictions),
+        "precision_macro": precision_score(labels, predictions, average="macro", zero_division=0),
+        "recall_macro": recall_score(labels, predictions, average="macro", zero_division=0),
+        "specificity": specificity,
+        "f1_macro": f1_score(labels, predictions, average="macro", zero_division=0),
+        "roc_auc": roc_auc_score(labels, probabilities),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
+    return {key: float(value) for key, value in result.items()}
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray]:
+    model.eval()
+    losses: List[float] = []
+    labels_all: List[np.ndarray] = []
+    probabilities_all: List[np.ndarray] = []
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits = model(images)
+        loss = criterion(logits, labels)
+        losses.append(float(loss.item()) * labels.size(0))
+        probabilities = torch.softmax(logits, dim=1)[:, 1]
+        labels_all.append(labels.cpu().numpy())
+        probabilities_all.append(probabilities.cpu().numpy())
+    labels_np = np.concatenate(labels_all)
+    probabilities_np = np.concatenate(probabilities_all)
+    mean_loss = sum(losses) / max(1, len(loader.dataset))
+    return mean_loss, classification_metrics(labels_np, probabilities_np), labels_np, probabilities_np
+
+
+def parameter_count(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def train_one_run(
+    config: RunConfig,
+    output_dir: Path,
+    data_root: Path,
+    device: torch.device,
+    max_epochs: int,
+    patience: int,
+    min_epochs: int,
+    workers: int,
+    val_fraction: float,
+    max_train_per_class: Optional[int],
+    max_test_per_class: Optional[int],
+    save_checkpoints: bool,
+) -> Dict[str, Any]:
+    run_path = output_dir / "runs" / f"{config.run_id}.json"
+    prediction_path = output_dir / "predictions" / f"{config.run_id}.npz"
+    if run_path.exists() and prediction_path.exists():
+        with run_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("status") == "completed" and payload.get("schema_version") == SCHEMA_VERSION:
+            print(f"SKIP completed: {config.run_id}")
+            return payload
+
+    print(f"RUN {config.run_id}")
+    set_global_seed(config.seed)
+    spec = DATASETS[config.dataset]
+    train_loader, val_loader, test_loader, sizes = make_loaders(
+        spec,
+        data_root,
+        config.batch_size,
+        config.seed,
+        val_fraction,
+        workers,
+        max_train_per_class,
+        max_test_per_class,
+    )
+    model = build_model(config, spec).to(device)
+    optimizer = make_optimizer(config, model)
+    criterion = nn.CrossEntropyLoss()
+    tracker = LayerUpdateTracker(model)
+    epoch_rows: List[Dict[str, Any]] = []
+    layer_rows: List[Dict[str, Any]] = []
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    best_val_loss = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
+    total_steps = 0
+    start = time.perf_counter()
+
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        tracker.reset_epoch()
+        train_loss_sum = 0.0
+        train_labels: List[np.ndarray] = []
+        train_probabilities: List[np.ndarray] = []
+        for images, labels in train_loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(images)
+            loss = criterion(logits, labels)
+            loss.backward()
+            before = tracker.snapshot()
+            optimizer.step()
+            tracker.observe(before)
+            total_steps += 1
+            train_loss_sum += float(loss.item()) * labels.size(0)
+            train_labels.append(labels.detach().cpu().numpy())
+            train_probabilities.append(torch.softmax(logits.detach(), dim=1)[:, 1].cpu().numpy())
+
+        train_labels_np = np.concatenate(train_labels)
+        train_probabilities_np = np.concatenate(train_probabilities)
+        train_metrics = classification_metrics(train_labels_np, train_probabilities_np)
+        train_loss = train_loss_sum / max(1, len(train_loader.dataset))
+        val_loss, val_metrics, _, _ = evaluate(model, val_loader, criterion, device)
+        epoch_row: Dict[str, Any] = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "total_optimizer_steps": total_steps,
+        }
+        epoch_row.update({f"train_{k}": v for k, v in train_metrics.items()})
+        epoch_row.update({f"val_{k}": v for k, v in val_metrics.items()})
+        epoch_rows.append(epoch_row)
+        layer_rows.extend(tracker.epoch_rows(epoch))
+
+        improved = val_loss < best_val_loss - 1e-5
+        if improved:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            stale_epochs = 0
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        else:
+            stale_epochs += 1
+        print(
+            f"  epoch={epoch:02d} train_loss={train_loss:.4f} "
+            f"val_loss={val_loss:.4f} val_auc={val_metrics['roc_auc']:.4f}"
+        )
+        if epoch >= min_epochs and stale_epochs >= patience:
+            break
+
+    if best_state is None:
+        best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+    model.load_state_dict(best_state)
+    test_loss, test_metrics, test_labels, test_probabilities = evaluate(
+        model, test_loader, criterion, device
+    )
+    elapsed = time.perf_counter() - start
+    prediction_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        prediction_path,
+        labels=test_labels,
+        probabilities=test_probabilities,
+        run_id=np.asarray(config.run_id),
+    )
+    if save_checkpoints:
+        checkpoint_path = output_dir / "checkpoints" / f"{config.run_id}.pt"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(best_state, checkpoint_path)
+
+    chance = 0.5
+    collapsed = bool(
+        test_metrics["roc_auc"] < 0.60
+        or test_metrics["balanced_accuracy"] <= chance + 0.05
+        or best_val_loss >= math.log(2) - 0.01
+    )
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "completed",
+        "config": asdict(config),
+        "config_id": config.config_id,
+        "run_id": config.run_id,
+        "dataset_classes": {
+            "negative": spec.negative_class,
+            "positive": spec.positive_class,
+        },
+        "split_sizes": sizes,
+        "device": str(device),
+        "parameter_count": parameter_count(model),
+        "epochs_trained": len(epoch_rows),
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "test_loss": test_loss,
+        "test_metrics": test_metrics,
+        "collapsed": collapsed,
+        "training_seconds": elapsed,
+        "epoch_metrics": epoch_rows,
+        "layer_epoch_metrics": layer_rows,
+        "prediction_file": str(prediction_path.relative_to(output_dir)),
+    }
+    atomic_json_dump(json_safe(payload), run_path)
+    return payload
+
+
+def scenario_config(dataset: str, architecture: str, scenario: str, seed: int) -> RunConfig:
+    width = 128 if architecture == "mlp" else 32
+    common = dict(
+        dataset=dataset,
+        architecture=architecture,
+        scenario=scenario,
+        seed=seed,
+        width=width,
+        batch_size=64,
+        weight_decay=0.0,
+    )
+    scenarios: Dict[str, Dict[str, Any]] = {
+        "baseline": dict(
+            depth=4, activation="relu", residual=False,
+            optimizer="adam", learning_rate=1e-3,
+        ),
+        "high_lr": dict(
+            depth=4, activation="relu", residual=False,
+            optimizer="adam", learning_rate=1e-1,
+        ),
+        "deep_relu_plain": dict(
+            depth=16, activation="relu", residual=False,
+            optimizer="adam", learning_rate=1e-3,
+        ),
+        "deep_sigmoid_plain": dict(
+            depth=16, activation="sigmoid", residual=False,
+            optimizer="adam", learning_rate=1e-3,
+        ),
+        "deep_relu_residual": dict(
+            depth=16, activation="relu", residual=True,
+            optimizer="adam", learning_rate=1e-3,
+        ),
+        "sgd": dict(
+            depth=4, activation="relu", residual=False,
+            optimizer="sgd", learning_rate=1e-2,
+        ),
+        "momentum": dict(
+            depth=4, activation="relu", residual=False,
+            optimizer="momentum", learning_rate=1e-2,
+        ),
+        "rmsprop": dict(
+            depth=4, activation="relu", residual=False,
+            optimizer="rmsprop", learning_rate=1e-3,
+        ),
+        "batch16": dict(
+            depth=4, activation="relu", residual=False,
+            optimizer="adam", learning_rate=1e-3, batch_size=16,
+        ),
+        "batch128": dict(
+            depth=4, activation="relu", residual=False,
+            optimizer="adam", learning_rate=1e-3, batch_size=128,
+        ),
+        "shallow_sigmoid": dict(
+            depth=4, activation="sigmoid", residual=False,
+            optimizer="adam", learning_rate=1e-3,
+        ),
+    }
+    merged = {**common, **scenarios[scenario]}
+    return RunConfig(**merged)
+
+
+def experiment_matrix(preset: str, seeds: Sequence[int]) -> List[RunConfig]:
+    if preset == "paper":
+        # 3 datasets x 8 architecture/scenario pairs x 5 seeds = 120 runs.
+        # The MLP branch creates activation/depth failures; the CNN branch
+        # tests whether a residual route rescues a matched deep plain model.
+        datasets_selected = ["mnist", "fashion", "cifar"]
+        pairs = [
+            ("mlp", "baseline"),
+            ("mlp", "high_lr"),
+            ("mlp", "deep_relu_plain"),
+            ("mlp", "deep_sigmoid_plain"),
+            ("cnn", "baseline"),
+            ("cnn", "high_lr"),
+            ("cnn", "deep_relu_plain"),
+            ("cnn", "deep_relu_residual"),
+        ]
+        return [
+            scenario_config(dataset, architecture, scenario, seed)
+            for dataset in datasets_selected
+            for architecture, scenario in pairs
+            for seed in seeds
+        ]
+    elif preset == "extended":
+        scenarios = [
+            "baseline", "high_lr", "deep_relu_plain", "deep_sigmoid_plain",
+            "deep_relu_residual", "sgd", "momentum", "rmsprop",
+            "batch16", "batch128", "shallow_sigmoid",
+        ]
+        datasets_selected = ["mnist", "fashion", "cifar"]
+        architectures = ["mlp", "cnn"]
+    elif preset == "smoke":
+        scenarios = ["baseline", "high_lr"]
+        datasets_selected = ["mnist"]
+        architectures = ["mlp"]
+    else:
+        raise ValueError(f"Unknown preset: {preset}")
+    return [
+        scenario_config(dataset, architecture, scenario, seed)
+        for dataset in datasets_selected
+        for architecture in architectures
+        for scenario in scenarios
+        for seed in seeds
+    ]
+
+
+def load_completed_runs(output_dir: Path) -> List[Dict[str, Any]]:
+    runs: List[Dict[str, Any]] = []
+    for path in sorted((output_dir / "runs").glob("*.json")):
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("status") == "completed":
+            runs.append(payload)
+    if not runs:
+        raise FileNotFoundError(f"No completed runs found in {output_dir / 'runs'}")
+    return runs
+
+
+def flatten_runs(runs: Sequence[Mapping[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    run_rows: List[Dict[str, Any]] = []
+    epoch_rows: List[Dict[str, Any]] = []
+    layer_rows: List[Dict[str, Any]] = []
+    for payload in runs:
+        config = payload["config"]
+        common = {
+            **config,
+            "config_id": payload["config_id"],
+            "run_id": payload["run_id"],
+        }
+        run_row = {
+            **common,
+            "parameter_count": payload["parameter_count"],
+            "epochs_trained": payload["epochs_trained"],
+            "best_epoch": payload["best_epoch"],
+            "best_val_loss": payload["best_val_loss"],
+            "test_loss": payload["test_loss"],
+            "collapsed": int(payload["collapsed"]),
+            "training_seconds": payload["training_seconds"],
+            **{f"test_{key}": value for key, value in payload["test_metrics"].items()},
+        }
+        run_rows.append(run_row)
+        for row in payload["epoch_metrics"]:
+            epoch_rows.append({**common, **row})
+        for row in payload["layer_epoch_metrics"]:
+            layer_rows.append({**common, **row})
+    return pd.DataFrame(run_rows), pd.DataFrame(epoch_rows), pd.DataFrame(layer_rows)
+
+
+def percentile_ci(values: Sequence[float], rng: np.random.Generator, n_boot: int = 4000) -> Tuple[float, float]:
+    array = np.asarray(values, dtype=float)
+    if array.size == 1:
+        return float(array[0]), float(array[0])
+    samples = rng.choice(array, size=(n_boot, array.size), replace=True).mean(axis=1)
+    low, high = np.percentile(samples, [2.5, 97.5])
+    return float(low), float(high)
+
+
+def summarize_configs(run_df: pd.DataFrame) -> pd.DataFrame:
+    rng = np.random.default_rng(20260921)
+    metrics = [
+        "test_accuracy", "test_balanced_accuracy", "test_f1_macro",
+        "test_roc_auc", "test_loss", "best_val_loss", "best_epoch",
+        "training_seconds", "collapsed",
+    ]
+    rows: List[Dict[str, Any]] = []
+    group_columns = ["dataset", "architecture", "scenario", "config_id"]
+    for keys, group in run_df.groupby(group_columns, sort=True):
+        row = dict(zip(group_columns, keys))
+        row["n_seeds"] = len(group)
+        for metric in metrics:
+            values = group[metric].astype(float).to_numpy()
+            low, high = percentile_ci(values, rng)
+            row[f"{metric}_mean"] = float(values.mean())
+            row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+            row[f"{metric}_ci95_low"] = low
+            row[f"{metric}_ci95_high"] = high
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def paired_scenario_comparisons(run_df: pd.DataFrame) -> pd.DataFrame:
+    """Paired seed-wise differences between each scenario and its baseline."""
+    rng = np.random.default_rng(20260922)
+    metrics = [
+        "test_roc_auc",
+        "test_balanced_accuracy",
+        "test_f1_macro",
+        "test_loss",
+        "best_val_loss",
+        "best_epoch",
+    ]
+    rows: List[Dict[str, Any]] = []
+    for (dataset, architecture), block in run_df.groupby(["dataset", "architecture"]):
+        baseline = block[block.scenario == "baseline"].set_index("seed")
+        if baseline.empty:
+            continue
+        for scenario, candidate in block[block.scenario != "baseline"].groupby("scenario"):
+            candidate = candidate.set_index("seed")
+            common_seeds = sorted(set(baseline.index) & set(candidate.index))
+            if not common_seeds:
+                continue
+            for metric in metrics:
+                differences = (
+                    candidate.loc[common_seeds, metric].astype(float).to_numpy()
+                    - baseline.loc[common_seeds, metric].astype(float).to_numpy()
+                )
+                low, high = percentile_ci(differences, rng)
+                if len(differences) >= 2 and np.any(np.abs(differences) > EPS):
+                    try:
+                        wilcoxon = stats.wilcoxon(differences, alternative="two-sided", method="auto")
+                        statistic = float(wilcoxon.statistic)
+                        p_value = float(wilcoxon.pvalue)
+                    except ValueError:
+                        statistic, p_value = float("nan"), float("nan")
+                else:
+                    statistic, p_value = float("nan"), float("nan")
+                rows.append(
+                    {
+                        "dataset": dataset,
+                        "architecture": architecture,
+                        "scenario_vs_baseline": scenario,
+                        "metric": metric,
+                        "n_paired_seeds": len(common_seeds),
+                        "mean_paired_difference": float(differences.mean()),
+                        "paired_difference_ci95_low": low,
+                        "paired_difference_ci95_high": high,
+                        "wilcoxon_statistic": statistic,
+                        "p_value": p_value,
+                    }
+                )
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        finite = result.p_value.notna()
+        result["p_fdr_bh"] = np.nan
+        result.loc[finite, "p_fdr_bh"] = benjamini_hochberg(
+            result.loc[finite, "p_value"].to_numpy()
+        )
+    return result
+
+
+def metric_stability_table(diagnostics: pd.DataFrame) -> pd.DataFrame:
+    """Between-seed stability of aggregate and individual-edge diagnostics."""
+    metrics = [
+        "early_update_ratio_mean",
+        "early_gradient_l2_mean",
+        "early_update_entropy_mean",
+        "early_top3_share_mean",
+        "early_top1_occupancy_mean",
+        "early_top3_persistence_mean",
+    ]
+    rows: List[Dict[str, Any]] = []
+    group_columns = ["dataset", "architecture", "scenario", "config_id"]
+    for keys, group in diagnostics.groupby(group_columns):
+        for metric in metrics:
+            values = group[metric].astype(float).to_numpy()
+            mean = float(values.mean())
+            sd = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+            rows.append(
+                {
+                    **dict(zip(group_columns, keys)),
+                    "metric": metric,
+                    "n_seeds": len(values),
+                    "mean": mean,
+                    "standard_deviation": sd,
+                    "between_seed_coefficient_of_variation": sd / (abs(mean) + EPS),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def slope(values: Sequence[float]) -> float:
+    array = np.asarray(values, dtype=float)
+    if array.size < 2:
+        return 0.0
+    return float(np.polyfit(np.arange(array.size), array, 1)[0])
+
+
+def create_early_diagnostics(
+    run_df: pd.DataFrame,
+    epoch_df: pd.DataFrame,
+    layer_df: pd.DataFrame,
+    early_epochs: int = EARLY_EPOCHS,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for run_id, run_row in run_df.set_index("run_id").iterrows():
+        epochs = epoch_df[epoch_df.run_id == run_id].sort_values("epoch").head(early_epochs)
+        layers = layer_df[
+            (layer_df.run_id == run_id) & (layer_df.epoch <= early_epochs)
+        ]
+        if epochs.empty or layers.empty:
+            continue
+        feature_row = {
+            "run_id": run_id,
+            "config_id": run_row.config_id,
+            "dataset": run_row.dataset,
+            "architecture": run_row.architecture,
+            "scenario": run_row.scenario,
+            "seed": run_row.seed,
+            "collapsed": int(run_row.collapsed),
+            "final_test_auc": run_row.test_roc_auc,
+            "final_test_balanced_accuracy": run_row.test_balanced_accuracy,
+            "final_test_loss": run_row.test_loss,
+            "early_update_ratio_mean": layers.update_to_weight_ratio.mean(),
+            "early_update_ratio_max": layers.update_to_weight_ratio.max(),
+            "early_gradient_l2_mean": layers.gradient_l2.mean(),
+            "early_update_entropy_mean": layers.normalized_update_entropy.mean(),
+            "early_top3_share_mean": layers.top3_update_share.mean(),
+            "early_top1_occupancy_mean": layers.top1_max_occupancy.mean(),
+            "early_top3_persistence_mean": layers.top3_jaccard_previous_step.mean(),
+            "early_train_loss_mean": epochs.train_loss.mean(),
+            "early_val_loss_mean": epochs.val_loss.mean(),
+            "early_train_loss_slope": slope(epochs.train_loss),
+            "early_val_loss_slope": slope(epochs.val_loss),
+            "early_val_auc_last": epochs.val_roc_auc.iloc[-1],
+            "early_val_balanced_accuracy_last": epochs.val_balanced_accuracy.iloc[-1],
+        }
+        rows.append(feature_row)
+    diagnostics = pd.DataFrame(rows)
+    for column in ["early_update_ratio_mean", "early_update_ratio_max", "early_gradient_l2_mean"]:
+        diagnostics[f"log10_{column}"] = np.log10(diagnostics[column].clip(lower=EPS))
+    return diagnostics
+
+
+def grouped_predictor_comparison(diagnostics: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    comparison_columns = [
+        "predictor",
+        "features",
+        "n",
+        "grouped_cv_roc_auc",
+        "grouped_cv_average_precision",
+    ]
+    prediction_columns = [
+        "run_id",
+        "predictor",
+        "fold",
+        "true_collapse",
+        "predicted_probability",
+    ]
+
+    def empty_results(reason: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        print(f"Skipping grouped predictor comparison: {reason}")
+        return pd.DataFrame(columns=comparison_columns), pd.DataFrame(columns=prediction_columns)
+
+    features = {
+        "update_ratio": ["log10_early_update_ratio_mean"],
+        "gradient_norm": ["log10_early_gradient_l2_mean"],
+        "validation_loss_slope": ["early_val_loss_slope"],
+        "early_validation_auc": ["early_val_auc_last"],
+        "update_concentration": ["early_top3_share_mean"],
+        "all_internal": [
+            "log10_early_update_ratio_mean",
+            "log10_early_gradient_l2_mean",
+            "early_update_entropy_mean",
+            "early_top3_share_mean",
+            "early_top3_persistence_mean",
+        ],
+        "all_internal_plus_external": [
+            "log10_early_update_ratio_mean",
+            "log10_early_gradient_l2_mean",
+            "early_update_entropy_mean",
+            "early_top3_share_mean",
+            "early_top3_persistence_mean",
+            "early_val_loss_slope",
+            "early_val_auc_last",
+        ],
+    }
+    y = diagnostics.collapsed.astype(int).to_numpy()
+    groups = diagnostics.config_id.to_numpy()
+    if len(np.unique(y)) < 2:
+        return empty_results("the outcome contains only one class")
+
+    # StratifiedGroupKFold is constrained by more than the total number of
+    # groups.  In particular, every class must contain at least n_splits
+    # observations and must occur in enough distinct groups.  Small smoke
+    # experiments often have only one collapsed (or non-collapsed) run, in
+    # which case grouped cross-validation is not statistically possible.
+    class_counts = pd.Series(y).value_counts()
+    groups_per_class = (
+        pd.DataFrame({"outcome": y, "group": groups})
+        .groupby("outcome")["group"]
+        .nunique()
+    )
+    n_splits = min(
+        5,
+        int(pd.Series(groups).nunique()),
+        int(class_counts.min()),
+        int(groups_per_class.min()),
+    )
+    if n_splits < 2:
+        return empty_results(
+            "at least two observations and two distinct config groups are "
+            "required in each collapse class"
+        )
+
+    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    model = Pipeline(
+        [("scale", StandardScaler()), ("logit", LogisticRegression(max_iter=2000, class_weight="balanced"))]
+    )
+    rows: List[Dict[str, Any]] = []
+    prediction_rows: List[Dict[str, Any]] = []
+    try:
+        splits = list(splitter.split(np.zeros((len(y), 1)), y, groups))
+    except ValueError as exc:
+        return empty_results(str(exc))
+
+    for name, columns in features.items():
+        X = diagnostics[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
+        predictions = np.full(len(y), np.nan)
+        fold_ids = np.full(len(y), -1)
+        for fold, (train_index, test_index) in enumerate(splits):
+            if len(np.unique(y[train_index])) < 2:
+                continue
+            fitted = clone(model).fit(X[train_index], y[train_index])
+            predictions[test_index] = fitted.predict_proba(X[test_index])[:, 1]
+            fold_ids[test_index] = fold
+        valid = np.isfinite(predictions)
+        if valid.sum() and len(np.unique(y[valid])) == 2:
+            rows.append(
+                {
+                    "predictor": name,
+                    "features": ";".join(columns),
+                    "n": int(valid.sum()),
+                    "grouped_cv_roc_auc": roc_auc_score(y[valid], predictions[valid]),
+                    "grouped_cv_average_precision": average_precision_score(y[valid], predictions[valid]),
+                }
+            )
+            for index in np.flatnonzero(valid):
+                prediction_rows.append(
+                    {
+                        "run_id": diagnostics.iloc[index].run_id,
+                        "predictor": name,
+                        "fold": int(fold_ids[index]),
+                        "true_collapse": int(y[index]),
+                        "predicted_probability": float(predictions[index]),
+                    }
+                )
+    return (
+        pd.DataFrame(rows, columns=comparison_columns),
+        pd.DataFrame(prediction_rows, columns=prediction_columns),
+    )
+
+
+def bootstrap_spearman(x: np.ndarray, y: np.ndarray, seed: int = 42, n_boot: int = 4000) -> Tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    values: List[float] = []
+    for _ in range(n_boot):
+        index = rng.integers(0, len(x), len(x))
+        if np.unique(x[index]).size < 2 or np.unique(y[index]).size < 2:
+            continue
+        value = stats.spearmanr(x[index], y[index]).statistic
+        if np.isfinite(value):
+            values.append(float(value))
+    if not values:
+        return float("nan"), float("nan")
+    return tuple(np.percentile(values, [2.5, 97.5]).tolist())
+
+
+def correlation_table(diagnostics: pd.DataFrame) -> pd.DataFrame:
+    predictors = [
+        "log10_early_update_ratio_mean",
+        "log10_early_gradient_l2_mean",
+        "early_update_entropy_mean",
+        "early_top3_share_mean",
+        "early_top3_persistence_mean",
+        "early_val_loss_slope",
+        "early_val_auc_last",
+    ]
+    outcomes = ["final_test_auc", "final_test_balanced_accuracy", "final_test_loss"]
+    rows: List[Dict[str, Any]] = []
+    for predictor in predictors:
+        for outcome in outcomes:
+            subset = diagnostics[[predictor, outcome]].replace([np.inf, -np.inf], np.nan).dropna()
+            result = stats.spearmanr(subset[predictor], subset[outcome])
+            low, high = bootstrap_spearman(
+                subset[predictor].to_numpy(), subset[outcome].to_numpy(),
+                seed=int(hashlib.md5(f"{predictor}-{outcome}".encode()).hexdigest()[:8], 16),
+            )
+            rows.append(
+                {
+                    "predictor": predictor,
+                    "outcome": outcome,
+                    "n": len(subset),
+                    "spearman_rho": result.statistic,
+                    "p_value": result.pvalue,
+                    "bootstrap_ci95_low": low,
+                    "bootstrap_ci95_high": high,
+                }
+            )
+    table = pd.DataFrame(rows)
+    table["p_fdr_bh"] = benjamini_hochberg(table.p_value.to_numpy())
+    return table
+
+
+def benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
+    p_values = np.asarray(p_values, dtype=float)
+    order = np.argsort(p_values)
+    ranked = p_values[order]
+    adjusted = ranked * len(p_values) / np.arange(1, len(p_values) + 1)
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+    result = np.empty_like(adjusted)
+    result[order] = np.clip(adjusted, 0, 1)
+    return result
+
+
+def fixed_effects_models(diagnostics: pd.DataFrame) -> pd.DataFrame:
+    try:
+        import statsmodels.formula.api as smf
+    except ImportError:
+        print("statsmodels not installed; skipping fixed-effects models")
+        return pd.DataFrame()
+    data = diagnostics.copy()
+    formulas = {
+        "auc_update_ratio": (
+            "final_test_auc ~ log10_early_update_ratio_mean + C(dataset) + C(architecture)"
+        ),
+        "loss_update_ratio": (
+            "final_test_loss ~ log10_early_update_ratio_mean + C(dataset) + C(architecture)"
+        ),
+        "auc_full": (
+            "final_test_auc ~ log10_early_update_ratio_mean + "
+            "log10_early_gradient_l2_mean + early_update_entropy_mean + "
+            "early_top3_share_mean + early_val_loss_slope + "
+            "C(dataset) + C(architecture)"
+        ),
+    }
+    rows: List[Dict[str, Any]] = []
+    for model_name, formula in formulas.items():
+        try:
+            fitted = smf.ols(formula, data=data).fit(
+                cov_type="cluster", cov_kwds={"groups": data["config_id"]}
+            )
+            intervals = fitted.conf_int()
+            for term in fitted.params.index:
+                rows.append(
+                    {
+                        "model": model_name,
+                        "formula": formula,
+                        "term": term,
+                        "coefficient": fitted.params[term],
+                        "cluster_robust_se": fitted.bse[term],
+                        "p_value": fitted.pvalues[term],
+                        "ci95_low": intervals.loc[term, 0],
+                        "ci95_high": intervals.loc[term, 1],
+                        "r_squared": fitted.rsquared,
+                        "n": int(fitted.nobs),
+                    }
+                )
+        except Exception as exc:
+            print(f"Fixed-effects model failed ({model_name}): {exc}")
+    return pd.DataFrame(rows)
+
+
+def configure_plots() -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.1)
+    plt.rcParams.update(
+        {
+            "figure.dpi": 130,
+            "savefig.dpi": 300,
+            "font.family": "DejaVu Sans",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+        }
+    )
+
+
+def save_figure(fig: Any, output_dir: Path, name: str) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_dir / f"{name}.png", bbox_inches="tight")
+    fig.savefig(output_dir / f"{name}.pdf", bbox_inches="tight")
+
+
+def generate_figures(
+    run_df: pd.DataFrame,
+    epoch_df: pd.DataFrame,
+    layer_df: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    predictor_table: pd.DataFrame,
+    predictor_predictions: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    configure_plots()
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    figures_dir = output_dir / "figures"
+
+    # Figure 1: validation loss trajectories.
+    curve = (
+        epoch_df.groupby(["dataset", "architecture", "scenario", "epoch"], as_index=False)
+        .agg(val_loss_mean=("val_loss", "mean"), val_loss_sd=("val_loss", "std"))
+    )
+    graph = sns.relplot(
+        data=curve,
+        x="epoch",
+        y="val_loss_mean",
+        hue="scenario",
+        col="dataset",
+        row="architecture",
+        kind="line",
+        facet_kws={"sharey": False},
+        height=3.0,
+        aspect=1.2,
+    )
+    graph.set_axis_labels("Epoch", "Mean validation loss")
+    graph.set_titles("{row_name} | {col_name}")
+    save_figure(graph.figure, figures_dir, "figure_01_validation_loss_trajectories")
+    plt.close(graph.figure)
+
+    # Figure 2: early update ratio versus final performance.
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.3))
+    sns.scatterplot(
+        data=diagnostics,
+        x="log10_early_update_ratio_mean",
+        y="final_test_auc",
+        hue="scenario",
+        style="architecture",
+        size="collapsed",
+        sizes={0: 45, 1: 100},
+        ax=axes[0],
+    )
+    sns.scatterplot(
+        data=diagnostics,
+        x="log10_early_update_ratio_mean",
+        y="final_test_loss",
+        hue="dataset",
+        style="architecture",
+        size="collapsed",
+        sizes={0: 45, 1: 100},
+        ax=axes[1],
+    )
+    axes[0].set(xlabel="log10 early update-to-weight ratio", ylabel="Final test ROC-AUC")
+    axes[1].set(xlabel="log10 early update-to-weight ratio", ylabel="Final test loss")
+    save_figure(fig, figures_dir, "figure_02_early_update_ratio_vs_outcomes")
+    plt.close(fig)
+
+    # Figure 3: layer-by-layer early update heatmaps.
+    selected = layer_df[layer_df.epoch <= EARLY_EPOCHS].copy()
+    selected["log_update_ratio"] = np.log10(selected.update_to_weight_ratio.clip(lower=EPS))
+    for architecture in sorted(selected.architecture.unique()):
+        subset = selected[selected.architecture == architecture]
+        pivot = subset.pivot_table(
+            index="layer", columns="scenario", values="log_update_ratio", aggfunc="mean"
+        )
+        fig, ax = plt.subplots(figsize=(max(7, 1.4 * len(pivot.columns)), max(4, 0.3 * len(pivot))))
+        sns.heatmap(pivot, cmap="viridis", ax=ax, cbar_kws={"label": "log10 update/weight"})
+        ax.set_title(f"Early layer-wise update ratios: {architecture.upper()}")
+        save_figure(fig, figures_dir, f"figure_03_layer_heatmap_{architecture}")
+        plt.close(fig)
+
+    # Figure 4: grouped-CV diagnostic comparison.
+    if not predictor_table.empty:
+        melted = predictor_table.melt(
+            id_vars="predictor",
+            value_vars=["grouped_cv_roc_auc", "grouped_cv_average_precision"],
+            var_name="metric",
+            value_name="score",
+        )
+        fig, ax = plt.subplots(figsize=(9, 4.7))
+        sns.barplot(data=melted, x="score", y="predictor", hue="metric", ax=ax)
+        ax.axvline(0.5, color="black", linestyle="--", linewidth=1)
+        ax.set(xlim=(0, 1), xlabel="Grouped cross-validation score", ylabel="")
+        save_figure(fig, figures_dir, "figure_04_early_predictor_comparison")
+        plt.close(fig)
+
+    # Figure 5: cross-validated ROC curves.
+    if not predictor_predictions.empty:
+        fig, ax = plt.subplots(figsize=(6.2, 5.2))
+        for predictor, group in predictor_predictions.groupby("predictor"):
+            if group.true_collapse.nunique() < 2:
+                continue
+            fpr, tpr, _ = roc_curve(group.true_collapse, group.predicted_probability)
+            auc = roc_auc_score(group.true_collapse, group.predicted_probability)
+            ax.plot(fpr, tpr, label=f"{predictor} (AUC={auc:.2f})")
+        ax.plot([0, 1], [0, 1], "k--", linewidth=1)
+        ax.set(xlabel="False-positive rate", ylabel="True-positive rate", title="Early prediction of training collapse")
+        ax.legend(fontsize=8)
+        save_figure(fig, figures_dir, "figure_05_collapse_prediction_roc")
+        plt.close(fig)
+
+    # Figure 6: stable aggregate metric versus unstable individual-edge metric.
+    def between_seed_cv(values: pd.Series) -> float:
+        finite_values = values.replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
+        if len(finite_values) < 2:
+            return float("nan")
+        mean = float(np.mean(finite_values))
+        value = float(np.std(finite_values, ddof=1) / (abs(mean) + EPS))
+        return value if np.isfinite(value) else float("nan")
+
+    stability = (
+        diagnostics.groupby(["dataset", "architecture", "scenario"], as_index=False)
+        .agg(
+            update_ratio_cv=("early_update_ratio_mean", between_seed_cv),
+            top1_occupancy_cv=("early_top1_occupancy_mean", between_seed_cv),
+        )
+    )
+    stability_long = stability.melt(
+        id_vars=["dataset", "architecture", "scenario"],
+        value_vars=["update_ratio_cv", "top1_occupancy_cv"],
+        var_name="metric",
+        value_name="between_seed_cv",
+    ).replace([np.inf, -np.inf], np.nan).dropna(subset=["between_seed_cv"])
+    if stability_long.empty:
+        print(
+            "Skipping figure 06: between-seed stability requires at least "
+            "two completed seeds per dataset/architecture/scenario group"
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(7.5, 4.5))
+        sns.boxplot(data=stability_long, x="metric", y="between_seed_cv", ax=ax)
+        sns.stripplot(
+            data=stability_long,
+            x="metric",
+            y="between_seed_cv",
+            color="black",
+            alpha=0.45,
+            ax=ax,
+        )
+        ax.set(xlabel="", ylabel="Coefficient of variation across seeds")
+        save_figure(fig, figures_dir, "figure_06_aggregate_vs_edge_stability")
+        plt.close(fig)
+
+    # Figure 7: collapse rate by scenario.
+    collapse = (
+        run_df.groupby(["dataset", "architecture", "scenario"], as_index=False)
+        .collapsed.mean()
+    )
+    graph = sns.catplot(
+        data=collapse,
+        x="scenario",
+        y="collapsed",
+        hue="architecture",
+        col="dataset",
+        kind="bar",
+        height=3.2,
+        aspect=1.25,
+    )
+    graph.set_axis_labels("", "Collapse rate")
+    graph.set_xticklabels(rotation=35, ha="right")
+    save_figure(graph.figure, figures_dir, "figure_07_collapse_rates")
+    plt.close(graph.figure)
+
+
+def write_environment_manifest(output_dir: Path, args: argparse.Namespace, matrix: Sequence[RunConfig]) -> None:
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "created_utc": pd.Timestamp.utcnow().isoformat(),
+        "command": " ".join(sys.argv),
+        "arguments": vars(args),
+        "environment": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "torch": torch.__version__,
+            "torchvision": __import__("torchvision").__version__,
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        },
+        "matrix_size": len(matrix),
+        "matrix": [asdict(item) for item in matrix],
+    }
+    atomic_json_dump(json_safe(manifest), output_dir / "run_manifest.json")
+
+
+def run_experiments(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output).resolve()
+    data_root = Path(args.data_root).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    matrix = experiment_matrix(args.preset, args.seeds)
+    if args.datasets:
+        matrix = [item for item in matrix if item.dataset in args.datasets]
+    if args.architectures:
+        matrix = [item for item in matrix if item.architecture in args.architectures]
+    if args.scenarios:
+        matrix = [item for item in matrix if item.scenario in args.scenarios]
+    device = resolve_device(args.device)
+    write_environment_manifest(output_dir, args, matrix)
+    print(f"Device: {device}")
+    print(f"Experiment runs: {len(matrix)}")
+    for config in matrix:
+        train_one_run(
+            config=config,
+            output_dir=output_dir,
+            data_root=data_root,
+            device=device,
+            max_epochs=args.epochs,
+            patience=args.patience,
+            min_epochs=args.min_epochs,
+            workers=args.workers,
+            val_fraction=args.val_fraction,
+            max_train_per_class=args.max_train_per_class,
+            max_test_per_class=args.max_test_per_class,
+            save_checkpoints=args.save_checkpoints,
+        )
+
+
+def analyze_results(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output).resolve()
+    tables_dir = output_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    runs = load_completed_runs(output_dir)
+    run_df, epoch_df, layer_df = flatten_runs(runs)
+    config_summary = summarize_configs(run_df)
+    paired_comparisons = paired_scenario_comparisons(run_df)
+    diagnostics = create_early_diagnostics(run_df, epoch_df, layer_df)
+    stability = metric_stability_table(diagnostics)
+    predictor_table, predictor_predictions = grouped_predictor_comparison(diagnostics)
+    correlations = correlation_table(diagnostics)
+    models = fixed_effects_models(diagnostics)
+
+    outputs = {
+        "run_metrics.csv": run_df,
+        "epoch_metrics.csv": epoch_df,
+        "layer_epoch_metrics.csv": layer_df,
+        "config_summary.csv": config_summary,
+        "paired_scenario_comparisons.csv": paired_comparisons,
+        "early_diagnostics.csv": diagnostics,
+        "metric_stability_across_seeds.csv": stability,
+        "early_predictor_comparison.csv": predictor_table,
+        "early_predictor_cv_predictions.csv": predictor_predictions,
+        "spearman_correlations.csv": correlations,
+        "fixed_effects_models.csv": models,
+    }
+    for filename, dataframe in outputs.items():
+        dataframe.to_csv(tables_dir / filename, index=False)
+    generate_figures(
+        run_df,
+        epoch_df,
+        layer_df,
+        diagnostics,
+        predictor_table,
+        predictor_predictions,
+        output_dir,
+    )
+    summary = {
+        "completed_runs": len(run_df),
+        "unique_configurations": int(run_df.config_id.nunique()),
+        "datasets": sorted(run_df.dataset.unique().tolist()),
+        "architectures": sorted(run_df.architecture.unique().tolist()),
+        "collapse_count": int(run_df.collapsed.sum()),
+        "tables": sorted(outputs),
+        "figures": sorted(path.name for path in (output_dir / "figures").glob("*.png")),
+    }
+    atomic_json_dump(summary, output_dir / "analysis_summary.json")
+    print(json.dumps(summary, indent=2))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Unified multi-seed internal-dynamics experiment pipeline."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_common(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--output", required=True, help="Output directory")
+
+    run_parser = subparsers.add_parser("run", help="Run or resume experiments")
+    add_common(run_parser)
+    run_parser.add_argument("--preset", choices=["paper", "extended", "smoke"], default="paper")
+    run_parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    run_parser.add_argument("--epochs", type=int, default=30)
+    run_parser.add_argument("--patience", type=int, default=5)
+    run_parser.add_argument("--min-epochs", type=int, default=8)
+    run_parser.add_argument("--device", default="auto")
+    run_parser.add_argument("--data-root", default="./data")
+    run_parser.add_argument("--workers", type=int, default=2)
+    run_parser.add_argument("--val-fraction", type=float, default=0.2)
+    run_parser.add_argument("--max-train-per-class", type=int, default=5000)
+    run_parser.add_argument("--max-test-per-class", type=int, default=None)
+    run_parser.add_argument("--save-checkpoints", action="store_true")
+    run_parser.add_argument("--datasets", nargs="+", choices=sorted(DATASETS))
+    run_parser.add_argument("--architectures", nargs="+", choices=["mlp", "cnn"])
+    run_parser.add_argument(
+        "--scenarios",
+        nargs="+",
+        choices=[
+            "baseline", "high_lr", "deep_relu_plain", "deep_sigmoid_plain",
+            "deep_relu_residual", "sgd", "momentum", "rmsprop",
+            "batch16", "batch128", "shallow_sigmoid",
+        ],
+    )
+
+    analyze_parser = subparsers.add_parser("analyze", help="Create tables and figures from runs")
+    add_common(analyze_parser)
+
+    all_parser = subparsers.add_parser("all", help="Run experiments, then analyze")
+    add_common(all_parser)
+    for action in run_parser._actions:
+        if action.dest in {"help", "output"}:
+            continue
+        option_strings = action.option_strings
+        kwargs: Dict[str, Any] = {}
+        if action.default is not argparse.SUPPRESS:
+            kwargs["default"] = action.default
+        if action.const is not None and isinstance(action, argparse._StoreTrueAction):
+            kwargs["action"] = "store_true"
+        else:
+            if action.type is not None:
+                kwargs["type"] = action.type
+            if action.nargs is not None:
+                kwargs["nargs"] = action.nargs
+            if action.choices is not None:
+                kwargs["choices"] = action.choices
+        all_parser.add_argument(*option_strings, **kwargs)
+    return parser
+
+
+def main() -> None:
+    if len(sys.argv) == 1:
+        sys.argv.extend([
+            "all",
+            "--output", "results_paper",
+            "--preset", "paper",
+            "--seeds", "0", "1", "2", "3", "4",
+            "--epochs", "30",
+            "--patience", "5",
+            "--min-epochs", "8",
+            "--max-train-per-class", "5000",
+            "--workers", "0",
+            "--device", "auto",
+        ])
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command in {"run", "all"}:
+        if args.min_epochs > args.epochs:
+            args.min_epochs = args.epochs
+        run_experiments(args)
+    if args.command in {"analyze", "all"}:
+        analyze_results(args)
+
+
+if __name__ == "__main__":
+    main()
+D
